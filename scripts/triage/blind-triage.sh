@@ -48,11 +48,14 @@
 # -----------------------------
 #   scripts/triage/blind-triage.sh
 #
-# opens a menu: every case with its status (complete / awaiting phase N / phase N FAILED), then a
-# single CONTINUE action per case that works out whether that means "run the next phase" or
-# "resume the dead one" and does it. You never have to remember --phase versus --resume, or which
-# of a dozen directories a case lives in. `b` goes back anywhere, `q` quits, `n` starts a new case
-# in $EDITOR. Every flag below still works exactly as before.
+# opens a menu: every case with its status (plan ready / awaiting phase N / phase N FAILED), then a
+# single action per case that works out what that status means and does it —
+#   awaiting phase N   -> run phase N with the previous packet          (--phase N)
+#   phase N FAILED     -> resume phase N from its salvaged transcript   (--resume N)
+#   all four done      -> AUTHOR THE FIX from the approved plan         (--phase 4 --fix)
+# You never have to remember --phase versus --resume versus --fix, or which of a dozen directories
+# a case lives in. `v` pages the plan before you authorise it, `b` goes back anywhere, `q` quits,
+# `n` starts a new case in $EDITOR. Every flag below still works exactly as before.
 #
 # IF A PHASE DIES — packets/PHASE_BACKUP/
 # ---------------------------------------
@@ -240,7 +243,11 @@ _packet_of() {
 # Sets ST_DONE, ST_FAILED, ST_TEXT, ST_WHY.
 case_status() {
   local dir="$1" p
-  ST_DONE=0; ST_FAILED=0; ST_WHY=""
+  ST_DONE=0; ST_FAILED=0; ST_WHY=""; ST_FIXED=""
+  # --fix ends in a working-tree change, not a file, so nothing on disk would otherwise
+  # distinguish "plan written" from "plan written and authored". Without this the completed
+  # screen reads identically before and after the expensive run.
+  [[ -s "$dir/packets/FIX_AUTHORED" ]] && ST_FIXED="$(cat "$dir/packets/FIX_AUTHORED")"
   for p in 1 2 3 4; do
     [[ -s "$(_packet_of "$dir" "$p")" ]] && ST_DONE=$p
   done
@@ -261,7 +268,9 @@ case_status() {
   # because the second case had ST_DONE=0 and took that branch.
   local prefix=""
   (( ST_DONE > 0 )) && prefix="phases 1-${ST_DONE} done · "
-  if   (( ST_DONE == 4 )); then ST_TEXT="complete (4 of 4)"
+  if   (( ST_DONE == 4 )); then
+    if [[ -n "$ST_FIXED" ]]; then ST_TEXT="4 of 4 · fix authored"
+    else                          ST_TEXT="4 of 4 · plan ready to author"; fi
   elif (( ST_FAILED ));    then ST_TEXT="${prefix}phase ${ST_FAILED} FAILED${ST_WHY:+ ($ST_WHY)} · salvageable"
   elif (( ST_DONE == 0 )); then ST_TEXT="not started"
   else                          ST_TEXT="${prefix}awaiting phase ${next}"
@@ -289,9 +298,9 @@ menu_new_case() {
 }
 
 # The per-case screen. One action, because one action is the point: it reads the status and picks
-# --phase N+1 or --resume N so you never have to.
+# --phase N+1, --resume N, or --phase 4 --fix so you never have to.
 menu_case() {
-  local dir="$1" key
+  local dir="$1" key keys
   while true; do
     case_status "$dir"
     say ""
@@ -301,7 +310,17 @@ menu_case() {
     rule
     say ""
     if (( ST_DONE == 4 )); then
-      say "${DIM}This case is finished — all four phases have packets. Nothing to continue.${N}"
+      # ST_DONE==4 means phase4-plan.md is on disk, so a plan ALWAYS exists here — phase 4 in plan
+      # mode is the only thing that writes that file. The remaining move is authoring it, which is
+      # a separate, fresh-context run and the one step this menu used to send you to the flags for.
+      say "  ${B}1${N}  ${CYA}AUTHOR THE FIX${N} → implement the approved plan in your working tree"
+      say "     ${DIM}Fresh context, the plan pasted in as the ask. Edit is in the toolset, so this${N}"
+      say "     ${DIM}one DOES change source — uncommitted, and the commit stays yours.${N}"
+      say "     ${DIM}Re-runnable: it reads the plan, never consumes it.${N}"
+      say ""
+      say "  ${B}v${N}  read the plan first  ${DIM}($(wc -l < "$(_packet_of "$dir" 4)") lines)${N}"
+      say "     ${DIM}$(_packet_of "$dir" 4)${N}"
+      [[ -n "$ST_FIXED" ]] && say "     ${YEL}note: a fix was already authored here on ${ST_FIXED}.${N}"
     elif (( ST_FAILED )); then
       say "  ${B}1${N}  ${CYA}CONTINUE${N} → resume phase ${ST_FAILED} from its salvaged run"
       say "     ${DIM}Rebuilds the lost phase from its own transcript — every thought, command${N}"
@@ -317,14 +336,22 @@ menu_case() {
     printf '%s' "> "
     read -r key < /dev/tty || key="q"
     case "${key,,}" in
-      1) (( ST_DONE == 4 )) && { say "${DIM}(nothing to continue)${N}"; continue; }
-         CASE_DIR="$dir"
-         if (( ST_FAILED )); then RESUME_PHASE=$ST_FAILED; START_PHASE=$ST_FAILED
-         else                     RESUME_PHASE=0;          START_PHASE=$((ST_DONE + 1)); fi
+      1) CASE_DIR="$dir"
+         if   (( ST_DONE == 4 )); then MODE="fix"; RESUME_PHASE=0; START_PHASE=4
+         elif (( ST_FAILED ));    then RESUME_PHASE=$ST_FAILED; START_PHASE=$ST_FAILED
+         else                          RESUME_PHASE=0;          START_PHASE=$((ST_DONE + 1)); fi
          return 0 ;;
+      v) if (( ST_DONE == 4 )); then
+           "${PAGER:-less}" "$(_packet_of "$dir" 4)" < /dev/tty > /dev/tty 2>&1 || true
+         else
+           say "${DIM}(no plan yet — phase 4 has not finished)${N}"
+         fi ;;
       b) return 1 ;;
       q) exit 0 ;;
-      *) say "${DIM}(unrecognised — 1, b or q)${N}" ;;
+      # Plain concatenation, never `$( ((x)) && printf … )` — see the note in case_status().
+      *) keys="1, b or q"
+         (( ST_DONE == 4 )) && keys="1, v, b or q"
+         say "${DIM}(unrecognised — ${keys})${N}" ;;
     esac
   done
 }
@@ -1229,6 +1256,8 @@ elif [[ "$MODE" == "plan" ]]; then
   say ""
   say "${DIM}Section 8 of the plan names the cheapest command to falsify it. Run that first.${N}"
 else
+  # Read back by case_status() so the menu can tell a planned case from an authored one.
+  (( DRY_RUN )) || date '+%Y-%m-%d %H:%M' > "$CASE_DIR/packets/FIX_AUTHORED"
   say "${B}Phase 4 done.${N} The change is in your working tree, UNCOMMITTED — that part is yours."
   say ""
   say "Next, in this order:"
