@@ -44,11 +44,42 @@
 # * PIPELINE_OFFLINE=1 comes from .claude/settings.json and is inherited by every phase, so the
 #   offline guard stays armed exactly as it is in the chat UI. No phase can spend on Gemini or other paid APIs.
 #
+# JUST RUN IT WITH NO ARGUMENTS
+# -----------------------------
+#   scripts/triage/blind-triage.sh
+#
+# opens a menu: every case with its status (complete / awaiting phase N / phase N FAILED), then a
+# single CONTINUE action per case that works out whether that means "run the next phase" or
+# "resume the dead one" and does it. You never have to remember --phase versus --resume, or which
+# of a dozen directories a case lives in. `b` goes back anywhere, `q` quits, `n` starts a new case
+# in $EDITOR. Every flag below still works exactly as before.
+#
+# IF A PHASE DIES — packets/PHASE_BACKUP/
+# ---------------------------------------
+# A phase composes its packet in one Write at the very end, so a seven-day limit or a container
+# drop a second earlier used to cost everything it had gathered. Several early cases died
+# that way. Each phase now streams its packet to packets/PHASE_BACKUP/phaseN_backup.md AS IT IS
+# TYPED, along with phaseN_narration.md (its report to you) and phaseN_thinking.md (its reasoning).
+# Nothing is asked of the phase and nothing about how it composes the packet changed — the driver
+# simply stops discarding the stream.
+#
+# A phase that dies BEFORE it starts writing leaves no packet at all — but its transcript in
+# logs/ has every thought, command and result. extract_thoughts_v2.py rebuilds the run from it
+# into packets/PHASE_BACKUP/phaseN_run.md, and that is what a resume is handed:
+#
+#   scripts/triage/blind-triage.sh --case <dir> --resume 3
+#
+# finishes the interrupted phase WITHOUT re-running its instruments. A truncated backup is never
+# promoted to packets/phaseN.md automatically; you are shown it and you decide.
+#
 # USAGE
+#   scripts/triage/blind-triage.sh                             # the menu — start here
 #   scripts/triage/blind-triage.sh "ECR-114: pinmux brief drops the peripheral column"
 #   scripts/triage/blind-triage.sh -f docs/verification_findings.csv
 #   scripts/triage/blind-triage.sh --fix "ECR-114: …"          # author the change, don't just plan
 #   scripts/triage/blind-triage.sh --case .triage/…_ecr-114 --phase 4 --fix   # approve a plan
+#   scripts/triage/blind-triage.sh --case .triage/…_ecr-114 --resume 3        # finish a dead phase
+#   scripts/triage/blind-triage.sh --case … --resume 3 --salvage-chars 8000   # cap a huge salvage
 #   scripts/triage/blind-triage.sh --help
 #
 set -Eeuo pipefail
@@ -59,7 +90,9 @@ set -Eeuo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 STREAM_FILTER="$HERE/_stream.py"
+RUN_EXTRACTOR="$HERE/extract_thoughts_v2.py"   # rebuilds a dead phase from its transcript
 SKILL_FILE="$REPO_ROOT/.claude/skills/blind-triage/SKILL.md"
+TRIAGE_ROOT="${TRIAGE_HOME:-$HOME/.claude-triage}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Defaults (every one overridable by a flag or an env var)
@@ -74,11 +107,37 @@ FIX_MODEL="${TRIAGE_FIX_MODEL:-}"      # phase 4: authoring. Empty => same as MO
 PERM_MODE="${TRIAGE_PERMISSION_MODE:-acceptEdits}"
 CASE_DIR=""
 START_PHASE=1
+RESUME_PHASE=0                         # --resume N: finish phase N from its live backup
 STOP_AFTER=4
 AUTO=0
 DRY_RUN=0
 REPORT_TEXT=""
 REPORT_FILE=""
+# How much of each tool result the salvage keeps. 0 = keep everything, AND THAT IS THE DEFAULT.
+#
+# It was briefly 4000, trimming the middle out of longer results. That is wrong here, and the
+# reason is the protocol rather than the size: SYS_P1 requires that "every list a tool returns
+# gets a per-row verdict in writing", and EVERY-ROW DISPOSITION is a packet field. Look at what
+# actually exceeds 4000 chars in real phases —
+#
+#   a ~200-line audit report     tools/transcript_audit.py --run …     <- the FIRST instrument
+#   a ~140-line audit report     tools/transcript_audit.py --run …
+#   a ~160-line forensics pack   tools/run_forensics.py --run …
+#   a ~150-line loader audit     tools/loader_audit.py
+#   a ~140-line range of source  sed -n A,Bp <module>.py               <- source, mid-function
+#
+# — every one is either an audit table whose ROWS are the evidence, or a range of source code.
+# Cutting the middle out of a 200-row audit hands the resumed phase a list it cannot verdict, and
+# it cannot even tell that rows are missing, because the half-packet it is continuing already
+# carries verdicts for rows the salvage no longer shows. A silently incomplete evidence list is
+# the failure mode this whole protocol is built to prevent.
+#
+# The cost of keeping everything is small and bounded. Uncapped salvage + inherited packet, real
+# case: phase prompts of a couple of hundred thousand chars (~50k tokens) —
+# against a 1M context window, and as CACHED INPUT. Re-running phase 4 instead cost far more in
+# output tokens and did not finish. The flag stays as an escape hatch if a prompt ever gets
+# absurd; it is not something you should need to reach for.
+SALVAGE_CHARS=0
 MODE="${TRIAGE_PHASE4_MODE:-plan}"     # plan | fix. See "PLAN BY DEFAULT" above.
 
 # Git stays the human's, in every phase. This is the CLI-level deny; .claude/hooks/git_write_guard.py
@@ -90,6 +149,21 @@ GIT_DENY=(
   "Bash(git push:*)"  "Bash(git pull:*)"    "Bash(git stash:*)"    "Bash(git tag:*)"
   "Bash(git restore:*)" "Bash(git cherry-pick:*)" "Bash(git revert:*)" "Bash(git clean:*)"
 )
+
+# The live backups sit under packets/, which IS granted to every phase (--add-dir, in run_claude).
+# That grant is safe for the packets themselves — they are the designed handoff, blinded by
+# construction — but a backup is not: phaseN_narration.md is the phase's own unblinded report, and
+# phaseN_thinking.md would be its reasoning if the CLI ever populates it. Either would hand phase
+# N+1 the thing the /clear exists to drop. So the directory is written by the harness and readable
+# by nobody in-session. The resume path pastes a backup INTO a prompt rather than granting a read,
+# which is why this deny never has to be lifted.
+#
+# THE PATTERN FORM MATTERS AND IT FAILS SILENTLY. Observed: with
+# `Read(**/PHASE_BACKUP/**)` a phase read the backup and printed its first line, with NO permission
+# denial recorded — gitignore-style patterns resolve against the workspace, and the case dir is
+# deliberately outside it. The absolute form `Read(//abs/path/**)` (leading //, no leading slash on
+# the path) refused the identical prompt. Populated below, once CASE_DIR is absolute.
+BACKUP_DENY=()
 
 # Phases 1-3 measure; they have no business editing source. Write survives only because each phase
 # has to write its handoff packet. Phase 4 gets TOOLS_MEASURE too unless --fix was passed, so
@@ -120,6 +194,7 @@ usage() {
 # ─────────────────────────────────────────────────────────────────────────────
 # Arguments
 # ─────────────────────────────────────────────────────────────────────────────
+ORIG_ARGC=$#          # the menu opens only when invoked with nothing at all
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -f|--file)        REPORT_FILE="${2:?--file needs a path}"; shift 2 ;;
@@ -127,7 +202,9 @@ while [[ $# -gt 0 ]]; do
     --fix-model)      FIX_MODEL="${2:?--fix-model needs an alias}"; shift 2 ;;
     --case)           CASE_DIR="${2:?--case needs a directory}"; shift 2 ;;
     --phase)          START_PHASE="${2:?--phase needs 1-4}"; shift 2 ;;
+    --resume)         RESUME_PHASE="${2:?--resume needs 1-4}"; START_PHASE="$RESUME_PHASE"; shift 2 ;;
     --stop-after)     STOP_AFTER="${2:?--stop-after needs 1-4}"; shift 2 ;;
+    --salvage-chars)  SALVAGE_CHARS="${2:?--salvage-chars needs a number (0 = uncapped)}"; shift 2 ;;
     --permission-mode) PERM_MODE="${2:?}"; shift 2 ;;
     --fix)            MODE="fix"; shift ;;
     --plan)           MODE="plan"; shift ;;
@@ -139,15 +216,182 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# ─────────────────────────────────────────────────────────────────────────────
+# The menu — what you get when you run this with no arguments at all
+#
+# Every flag below still works exactly as before; this only fills the case that used to die with
+# "no report given". It exists because remembering whether a case wants --phase or --resume, and
+# which of six directories it lives in, is the part that made this hard to come back to.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Where a case's deliverable for a phase lands. Mirrors packet_path_for(), which is defined far
+# below and therefore not yet callable here, and takes the case as an argument rather than
+# reading $CASE_DIR — the menu inspects cases it has not selected yet.
+_packet_of() {
+  local dir="$1" phase="$2"
+  if (( phase == 4 )); then printf '%s' "$dir/packets/phase4-plan.md"
+  else                      printf '%s' "$dir/packets/phase${phase}.md"; fi
+}
+
+# Read a case's state off the filesystem. No transcript parsing — the presence or absence of a
+# packet beside a log is the whole signal, and it is unambiguous:
+#   packet present            -> that phase finished
+#   log present, packet absent -> that phase RAN AND DIED, and its transcript can be salvaged
+# Sets ST_DONE, ST_FAILED, ST_TEXT, ST_WHY.
+case_status() {
+  local dir="$1" p
+  ST_DONE=0; ST_FAILED=0; ST_WHY=""
+  for p in 1 2 3 4; do
+    [[ -s "$(_packet_of "$dir" "$p")" ]] && ST_DONE=$p
+  done
+  local next=$((ST_DONE + 1))
+  if (( next <= 4 )) && compgen -G "$dir/logs/phase${next}*.jsonl" >/dev/null; then
+    ST_FAILED=$next
+    # One cheap grep for the two endings worth naming in a list.
+    if grep -ql '"status":"rejected"' "$dir/logs/phase${next}.jsonl" 2>/dev/null; then
+      ST_WHY="rate limit"
+    elif ! grep -ql '"type":"result"' "$dir/logs/phase${next}.jsonl" 2>/dev/null; then
+      ST_WHY="cut off mid-stream"
+    fi
+  fi
+
+  # Built with plain concatenation, NOT `$( ((x)) && printf … )`. Under `set -Eeuo pipefail` a
+  # command substitution whose body is false makes the ASSIGNMENT return non-zero, which kills
+  # the script — seen here: the case list rendered only its first row and exited 0,
+  # because the second case had ST_DONE=0 and took that branch.
+  local prefix=""
+  (( ST_DONE > 0 )) && prefix="phases 1-${ST_DONE} done · "
+  if   (( ST_DONE == 4 )); then ST_TEXT="complete (4 of 4)"
+  elif (( ST_FAILED ));    then ST_TEXT="${prefix}phase ${ST_FAILED} FAILED${ST_WHY:+ ($ST_WHY)} · salvageable"
+  elif (( ST_DONE == 0 )); then ST_TEXT="not started"
+  else                          ST_TEXT="${prefix}awaiting phase ${next}"
+  fi
+  return 0
+}
+
+# A new case needs a multi-line report, which `read -r` mangles. An editor handles paste properly.
+menu_new_case() {
+  local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/blind-triage-report.XXXXXX")"
+  {
+    echo "# Paste the bug report below, save, and quit."
+    echo "# Lines starting with # are ignored. An empty file cancels."
+  } > "$tmp"
+  "${EDITOR:-nano}" "$tmp" < /dev/tty > /dev/tty 2>&1 || true
+  local text; text="$(grep -v '^#' "$tmp" | sed '/./,$!d')"
+  rm -f "$tmp"
+  if [[ -z "${text//[[:space:]]/}" ]]; then
+    say "${DIM}(cancelled — empty report)${N}"
+    return 1
+  fi
+  REPORT_TEXT="$text"
+  CASE_DIR=""; START_PHASE=1; RESUME_PHASE=0
+  return 0
+}
+
+# The per-case screen. One action, because one action is the point: it reads the status and picks
+# --phase N+1 or --resume N so you never have to.
+menu_case() {
+  local dir="$1" key
+  while true; do
+    case_status "$dir"
+    say ""
+    rule
+    say "${B}case:${N} $(basename "$dir")"
+    say "${B}status:${N} $ST_TEXT"
+    rule
+    say ""
+    if (( ST_DONE == 4 )); then
+      say "${DIM}This case is finished — all four phases have packets. Nothing to continue.${N}"
+    elif (( ST_FAILED )); then
+      say "  ${B}1${N}  ${CYA}CONTINUE${N} → resume phase ${ST_FAILED} from its salvaged run"
+      say "     ${DIM}Rebuilds the lost phase from its own transcript — every thought, command${N}"
+      say "     ${DIM}and result, in order — and retries it. The instruments are NOT re-run.${N}"
+    else
+      say "  ${B}1${N}  ${CYA}CONTINUE${N} → run phase $((ST_DONE + 1))"
+      say "     ${DIM}Phase ${ST_DONE} finished and its packet is on disk. This hands that packet${N}"
+      say "     ${DIM}to a fresh, context-cleared phase $((ST_DONE + 1)), exactly as the protocol wants.${N}"
+    fi
+    say ""
+    say "  ${B}b${N}  back to the case list      ${B}q${N}  quit"
+    say ""
+    printf '%s' "> "
+    read -r key < /dev/tty || key="q"
+    case "${key,,}" in
+      1) (( ST_DONE == 4 )) && { say "${DIM}(nothing to continue)${N}"; continue; }
+         CASE_DIR="$dir"
+         if (( ST_FAILED )); then RESUME_PHASE=$ST_FAILED; START_PHASE=$ST_FAILED
+         else                     RESUME_PHASE=0;          START_PHASE=$((ST_DONE + 1)); fi
+         return 0 ;;
+      b) return 1 ;;
+      q) exit 0 ;;
+      *) say "${DIM}(unrecognised — 1, b or q)${N}" ;;
+    esac
+  done
+}
+
+menu_main() {
+  local -a cases=()
+  local d key
+  while true; do
+    cases=()
+    if [[ -d "$TRIAGE_ROOT" ]]; then
+      while IFS= read -r d; do cases+=("$d"); done \
+        < <(find "$TRIAGE_ROOT" -mindepth 1 -maxdepth 1 -type d | sort -r)
+    fi
+
+    say ""
+    rule
+    say "${B}blind-triage${N}  ${DIM}— $TRIAGE_ROOT${N}"
+    rule
+    if (( ${#cases[@]} == 0 )); then
+      say "${DIM}(no cases yet)${N}"
+    else
+      local i=1
+      for d in "${cases[@]}"; do
+        case_status "$d"
+        printf '  %s%2d%s  %-44s %s\n' "$B" "$i" "$N" "$(basename "$d" | cut -c1-44)" "$ST_TEXT"
+        i=$((i + 1))
+      done
+    fi
+    say ""
+    say "  ${B}n${N}  new case (opens ${EDITOR:-nano} for the report)      ${B}q${N}  quit"
+    say ""
+    printf '%s' "> "
+    read -r key < /dev/tty || key="q"
+    case "${key,,}" in
+      q) exit 0 ;;
+      n) menu_new_case && return 0 ;;
+      ''"") : ;;
+      *) if [[ "$key" =~ ^[0-9]+$ ]] && (( key >= 1 && key <= ${#cases[@]} )); then
+           menu_case "${cases[$((key - 1))]}" && return 0
+         else
+           say "${DIM}(unrecognised — a number from the list, n, or q)${N}"
+         fi ;;
+    esac
+  done
+}
+
+if (( ORIG_ARGC == 0 )) && [[ -t 0 && -t 1 ]]; then
+  menu_main
+fi
+
 [[ -x "$(command -v claude)" ]] || die "the 'claude' CLI is not on PATH."
 [[ -f "$SKILL_FILE" ]] || die "blind-triage skill not found at $SKILL_FILE"
+[[ -f "$RUN_EXTRACTOR" ]] || die "salvage tool not found at $RUN_EXTRACTOR (needed by --resume)"
 (( START_PHASE >= 1 && START_PHASE <= 4 )) || die "--phase must be 1-4"
 (( STOP_AFTER >= START_PHASE && STOP_AFTER <= 4 )) || die "--stop-after must be >= --phase and <= 4"
 [[ "$MODE" == "plan" || "$MODE" == "fix" ]] || die "mode must be plan or fix (--plan / --fix)"
 [[ -n "$FIX_MODEL" ]] || FIX_MODEL="$MODEL"
 
+(( RESUME_PHASE >= 0 && RESUME_PHASE <= 4 )) || die "--resume must be 1-4"
+if (( RESUME_PHASE > 0 )); then
+  [[ -n "$CASE_DIR" ]] || die "--resume needs --case <dir> — the backup it continues lives there."
+fi
+
 # A report is required to START at phase 1; resuming later needs a case dir with packets in it.
-if (( START_PHASE == 1 )); then
+# --resume 1 is the exception: Phase 0 already ran, so the blinded symptom comes from the backup
+# and re-feeding the original report would un-blind the phase it is resuming.
+if (( START_PHASE == 1 && RESUME_PHASE == 0 )); then
   if [[ -z "$REPORT_TEXT" && -z "$REPORT_FILE" && ! -t 0 ]]; then
     REPORT_TEXT="$(cat)"            # allows:  cat finding.txt | blind-triage.sh
   fi
@@ -180,9 +424,48 @@ fi
 mkdir -p "$CASE_DIR"/{prompts,logs,packets,scratch}
 CASE_DIR="$(cd "$CASE_DIR" && pwd)"
 
+# Now that CASE_DIR is absolute, the backup deny can be written in the only form that actually
+# matches (see BACKUP_DENY above). `${_bk#/}` strips the leading slash so the rule reads
+# `Read(//home/you/.claude-triage/<case>/packets/PHASE_BACKUP/**)`.
+_bk="$CASE_DIR/packets/PHASE_BACKUP"
+BACKUP_DENY=(
+  "Read(//${_bk#/}/**)" "Glob(//${_bk#/}/**)" "Grep(//${_bk#/}/**)"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# --thinking-display: the flag that un-blanks the reasoning trace
+#
+# The CLI decides thinking visibility from four inputs, and only ONE of them is reachable from a
+# headless run. Measured on 2.1.234 by reading the compiled binary:
+#
+#   if (explicitDisplay)   return explicitDisplay;            // <- the flag; wins outright
+#   if (!isNonInteractive) return showThinkingSummaries()…    // <- settings.json, INTERACTIVE ONLY
+#   …                      return undefined;                  // <- headless lands here => blank
+#
+# So `showThinkingSummaries: true` in settings.json does nothing for `claude -p` — confirmed
+# empirically, 0 characters at 411 thinking tokens. `--thinking-display summarized` sets
+# explicitDisplay and bypasses the branch entirely.
+#
+# IT IS FREE. Paired runs, same prompt: without: a few dozen thinking tokens, no thinking text captured;
+# with: about the same tokens and cost, some text captured. Thinking tokens are billed either way and the summariser costs
+# nothing — a long phase 4 paid for thousands of thinking tokens and got only empty deltas.
+#
+# THE FLAG IS UNDOCUMENTED (`.hideHelp()`), so it may vanish in a CLI update — and `claude` uses
+# Commander, which EXITS on an unknown option. Unguarded, that would kill every phase at launch.
+# The probe below distinguishes the two cases for $0 and with no API call: an invalid VALUE for a
+# flag that exists is a parse error (exit 1, message names the flag), while an unknown flag
+# alongside --help is ignored (exit 0).
+THINKING_ARGS=()
+if _td_probe=$(claude --thinking-display bogusvalue --help 2>&1); then
+  :   # exit 0 => the flag was ignored as unknown => this CLI no longer has it
+else
+  [[ "$_td_probe" == *"thinking-display"* ]] && THINKING_ARGS=(--thinking-display summarized)
+fi
+unset _td_probe
+
 # The original report is stored ONCE, here, and never re-fed to a later phase. Phase 0 blinds it;
 # re-pasting it downstream is the documented way to re-poison the protocol.
-if (( START_PHASE == 1 )); then
+if (( START_PHASE == 1 && RESUME_PHASE == 0 )); then
   if [[ -n "$REPORT_FILE" ]]; then
     [[ -f "$REPORT_FILE" ]] || die "no such file: $REPORT_FILE"
     REPORT_FILE="$(cd "$(dirname "$REPORT_FILE")" && pwd)/$(basename "$REPORT_FILE")"
@@ -252,8 +535,16 @@ run_claude() {
   fi
 
   # Notes on the invocation, each one paid for by a failed experiment:
-  #   < /dev/null       the prompt is an argument; without this the CLI waits 3s for stdin that
-  #                     never comes, and warns about it.
+  #   < "$prompt_file"  THE PROMPT GOES IN ON STDIN, NOT AS AN ARGUMENT, and it must stay that
+  #                     way. Linux caps a single argv element at MAX_ARG_STRLEN = 32 pages =
+  #                     131,072 bytes, and execve fails with E2BIG past it — for any binary, not
+  #                     just scripts. Observed: a phase-4 resume prompt (previous
+  #                     packet plus a salvaged run) came to over 140 KB and died with
+  #                     "Argument list too long" before `claude` ran at all. Ordinary phase
+  #                     prompts sit far below it and never hit it, so this only shows up on the
+  #                     resume path — the one path that exists for recovering lost work.
+  #                     Piping has no such limit. Verified: `claude -p` reads the prompt from
+  #                     stdin and answers identically.
   #   --allowed-tools   acceptEdits does NOT auto-approve Bash. It waves through commands the CLI
   #                     classifies as safe (`echo`, `git status`) and PROMPTS for the rest — and a
   #                     prompt with no human is a denial. Observed: every
@@ -267,17 +558,35 @@ run_claude() {
   #                     to "$CASE_DIR"; that hands Phase 2 the sealed report.
   #   2>&1              folds the CLI's own warnings (e.g. an untrusted workspace) into the stream,
   #                     so they reach the log and the human instead of vanishing.
+  #   --include-partial-messages
+  #                     emits the Write tool's arguments as input_json_delta chunks WHILE they
+  #                     are generated, which is what lets _stream.py mirror the packet to
+  #                     PHASE_BACKUP/ as it is typed. Observed: several early cases had
+  #                     lost a phase, each one dying before its single closing Write — so
+  #                     everything the phase measured went with it. Verified on CLI 2.1.234; a
+  #                     SIGKILLed capture still left the packet up to its last flush on disk.
+  #   --thinking-display summarized
+  #                     (in THINKING_ARGS, empty if this CLI lacks the flag) makes the reasoning
+  #                     arrive as text instead of empty deltas, at no cost — see the block where
+  #                     THINKING_ARGS is built. Without it a phase that dies BEFORE its Write
+  #                     leaves nothing at all: one phase 4 made dozens of tool calls,
+  #                     zero Writes, and burned thousands of thinking tokens that arrived blank.
   set +e
-  claude -p "$(cat "$prompt_file")" \
+  claude -p \
     --model "$model" \
-    --output-format stream-json --verbose \
+    --output-format stream-json --verbose --include-partial-messages \
+    "${THINKING_ARGS[@]}" \
     --permission-mode "$PERM_MODE" \
     --tools "$tools" \
     --allowed-tools "Bash" "Read" "Grep" "Glob" "Write" \
-    --disallowed-tools "${GIT_DENY[@]}" \
+    --disallowed-tools "${GIT_DENY[@]}" "${BACKUP_DENY[@]}" \
     --add-dir "$CASE_DIR/packets" "$CASE_DIR/scratch" \
     --append-system-prompt "$sys_prompt" \
-    < /dev/null 2>&1 | tee "$log" | python3 "$STREAM_FILTER"
+    < "$prompt_file" 2>&1 | tee "$log" \
+    | python3 "$STREAM_FILTER" \
+        --backup-dir "$CASE_DIR/packets/PHASE_BACKUP" \
+        --phase "$phase" \
+        --packet "$(packet_path_for "$phase")"
   local status=${PIPESTATUS[0]}
   set -e
   return "$status"
@@ -305,8 +614,13 @@ run_phase() {
   say "${B}${label}${N}  ${DIM}· model=$model · fresh context (this is the /clear)${N}"
   rule
 
-  run_claude "$phase" "$prompt_file" "$model" "$tools" "$sys_prompt" \
-    || die "phase $phase: claude exited non-zero. Transcript: $CASE_DIR/logs/phase${phase}.jsonl"
+  # A phase killed by a rate limit or a container drop lands HERE, not on the missing-packet
+  # branch below — so the backup has to be offered on both paths or the one that actually
+  # happens is the one that stays silent.
+  if ! run_claude "$phase" "$prompt_file" "$model" "$tools" "$sys_prompt"; then
+    report_backup "$phase"
+    die "phase $phase: claude exited non-zero. Transcript: $CASE_DIR/logs/phase${phase}.jsonl"
+  fi
 
   (( DRY_RUN )) && return 0
   # In --fix mode phase 4 ends in a working-tree change, not a file we can check for.
@@ -316,11 +630,38 @@ run_phase() {
     local resume_hint=""
     (( phase < 4 )) && resume_hint="
        …then resume with:  $0 --case '$CASE_DIR' --phase $((phase + 1))"
-    extract_packet_from_log "$CASE_DIR/logs/phase${phase}.jsonl" "$packet" \
-      || die "phase $phase wrote nothing to $packet.
+    if ! extract_packet_from_log "$CASE_DIR/logs/phase${phase}.jsonl" "$packet"; then
+      report_backup "$phase"
+      die "phase $phase wrote nothing to $packet.
        Read the transcript ($CASE_DIR/logs/phase${phase}.jsonl) and salvage it by hand into that
        path.${resume_hint}"
+    fi
     say "${YEL}note:${N} recovered from the transcript rather than written directly."
+  fi
+}
+
+# What the human is told when a phase died without delivering. The backup is deliberately NOT
+# promoted into $packet: the driver's completeness test is `[[ ! -s "$packet" ]]`, which a
+# truncated file passes, and a half-packet silently inherited as a whole one is worse than a
+# visible failure — the next phase would reason from an amputated evidence list and never know.
+report_backup() {
+  local phase="$1"
+  local backup="$CASE_DIR/packets/PHASE_BACKUP/phase${phase}_backup.md"
+  local narration="$CASE_DIR/packets/PHASE_BACKUP/phase${phase}_narration.md"
+
+  if [[ -s "$backup" ]]; then
+    say ""
+    say "${YEL}the packet was captured as it was being written, and it is TRUNCATED:${N}"
+    say "  ${CYA}${backup}${N}  ($(wc -c < "$backup") bytes, $(wc -l < "$backup") lines)"
+    say "  ${DIM}last line: $(tail -n 1 "$backup" | cut -c1-70)${N}"
+    say ""
+    say "  Resume the phase from it — the instruments it reports are NOT re-run:"
+    say "    ${CYA}$0 --case '$CASE_DIR' --resume $phase${N}"
+  elif [[ -s "$narration" ]]; then
+    say ""
+    say "${YEL}no packet was started, but the phase's report was captured:${N}"
+    say "  ${CYA}${narration}${N}  ($(wc -c < "$narration") bytes)"
+    say "    ${CYA}$0 --case '$CASE_DIR' --resume $phase${N}"
   fi
 }
 
@@ -346,6 +687,13 @@ stop_line() {
       || say "${RED}glance check:${N} no ORPHAN OBSERVATIONS field in this packet. The skill says bounce it."
     grep -qi 'BOUNDARY DROPS' "$packet" \
       || say "${RED}glance check:${N} no BOUNDARY DROPS field. Phase 4 cannot build a drop ledger without it."
+    # A packet cut off mid-field is non-empty, so every other check here passes it and the next
+    # phase inherits an amputated evidence list as if it were whole. The tail is the cheapest
+    # tell: a finished packet ends on a field, a truncated one ends mid-sentence.
+    grep -qiE 'OPEN QUESTIONS|YOUR TASK|ORPHAN OBSERVATIONS' <<< "$(tail -n 12 "$packet")" \
+      || say "${RED}glance check:${N} this packet's last lines carry none of the closing fields —
+             it may be TRUNCATED. Compare it against
+             ${CASE_DIR}/packets/PHASE_BACKUP/phase${phase}_backup.md before continuing."
   fi
 
   if (( AUTO )); then
@@ -409,6 +757,19 @@ You are running HEADLESS, driven by scripts/triage/blind-triage.sh. Facts about 
 EOF
 }
 
+# NOTE ON THE RETIRED MARKER ECHO (removed)
+# ----------------------------------------------------
+# This block used to require the packet a SECOND time, re-printed between ===BEGIN PACKET=== and
+# ===END PACKET=== in the final message, as a salvage path for extract_packet_from_log below.
+# Observed across the early cases:
+#   * Every packet that exists has a matching Write call — the salvage produced ZERO.
+#   * Every failed phase has no Write AND no echo: the echo is emitted after the Write, so a
+#     dying session never reaches either. It only ever covered "the Write errored but the model
+#     kept talking", which has not once happened.
+#   * One phase 1 wrote a very large packet and echoed it all again — tens of thousands of output
+#     tokens at the phase close, in the case that then hit its usage limit and died two phases later.
+# The live capture in _stream.py replaces it and covers the window it structurally could not:
+# death DURING the write. extract_packet_from_log stays for logs recorded before this change.
 packet_contract() {
   local path="$1" noun="${2:-paste-ready handoff packet}"
   cat <<EOF
@@ -418,11 +779,6 @@ DELIVERABLE — BOTH of these, or the driver cannot carry your work forward:
   2. Write the $noun — and NOTHING ELSE in the file — to this exact path,
      using the Write tool:
        $path
-     Then repeat it in your final message between two literal marker lines:
-       ===BEGIN PACKET===
-       <the packet>
-       ===END PACKET===
-     (The file is what gets used; the markers are the salvage path if the write fails.)
 EOF
 }
 
@@ -590,6 +946,179 @@ FIXM
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# --resume: finish a phase that was interrupted
+#
+# The packet is the ONLY thing that crosses a phase boundary, so a phase that dies before writing
+# one cannot be continued — the driver's own guard (`[[ -s packets/phaseN.md ]]`) stops the run
+# dead, which is why two cases in ~/.claude-triage have been stuck.
+#
+# The live backup changes that. It holds the packet as far as it got, and the packet IS the
+# phase's verbatim instrument output — so handing it back is enough on its own, and the expensive
+# part (re-running the audits) is exactly what it avoids.
+#
+# The backup is PASTED IN, never granted as a read. That keeps BACKUP_DENY intact for every
+# session, including this one, and keeps the rule simple: nothing in-session ever reads that
+# directory. Only the resumed phase's OWN backup is included — never another phase's.
+# ─────────────────────────────────────────────────────────────────────────────
+# Rebuild the dead attempt from its own transcript.
+#
+# logs/phase<N>.jsonl is written live by `tee` and holds EVERYTHING — every thought, every command,
+# every tool result, in order. PHASE_BACKUP/ holds only the packet, the narration and the thinking,
+# so the log is a strict superset of it. That is why the salvage is built from the log: a phase
+# that died before writing anything still has all its tool calls and their output sitting in there.
+#
+# Prior attempts at the same phase are included. The keep-prior-attempts rename stamps the time of
+# the RE-RUN, not of the run inside (phase3.200931.jsonl actually started at 04:12), so filename
+# order is not run order — extract_thoughts_v2.py sorts by the first timestamp in each file.
+build_salvage() {
+  local phase="$1"
+  local out="$CASE_DIR/packets/PHASE_BACKUP/phase${phase}_run.md"
+  local -a logs=()
+  local f
+  for f in "$CASE_DIR/logs/phase${phase}.jsonl" "$CASE_DIR"/logs/phase"${phase}".*.jsonl; do
+    [[ -s "$f" ]] && logs+=("$f")
+  done
+  (( ${#logs[@]} )) || return 1
+
+  mkdir -p "$CASE_DIR/packets/PHASE_BACKUP"
+  python3 "$RUN_EXTRACTOR" "${logs[@]}" \
+      --max-result-chars "$SALVAGE_CHARS" -o "$out" >/dev/null 2>&1 || return 1
+  [[ -s "$out" ]] || return 1
+  printf '%s' "$out"
+}
+
+build_resume_prompt() {
+  local phase="$1"
+  local out="$CASE_DIR/prompts/phase${phase}.resume.txt"
+  local backup="$CASE_DIR/packets/PHASE_BACKUP/phase${phase}_backup.md"
+  local narration="$CASE_DIR/packets/PHASE_BACKUP/phase${phase}_narration.md"
+  local thinking="$CASE_DIR/packets/PHASE_BACKUP/phase${phase}_thinking.md"
+
+  # The salvage supersedes all three backup files — it CONTAINS them (the partial Write's content,
+  # the spoken text as ASSISTANT entries, the reasoning as THOUGHT entries) plus the tool calls and
+  # results they lack. Pasting both would hand the model two copies of its own half-packet.
+  local salvage=""
+  salvage="$(build_salvage "$phase")" || salvage=""
+
+  [[ -n "$salvage" || -s "$backup" || -s "$narration" ]] \
+    || die "nothing to resume for phase $phase: no transcript in $CASE_DIR/logs/ and no backup
+       in $CASE_DIR/packets/PHASE_BACKUP/."
+
+  {
+    echo "/blind-triage"
+    echo
+    headless_preamble
+    echo
+    case "$phase" in
+      1) echo "EXECUTE PHASE 1 (Evidence) ONLY. Phase 0 is already done — its blinded symptom is"
+         echo "in the interrupted packet below, and it is SEALED. Do not re-blind it, do not go"
+         echo "looking for the original report, and do not restate the symptom differently."
+         echo "Phase 1's hard ban still holds: no cause, no suspect module, no 'intersection',"
+         echo "no fix kind — not hedged, not parenthetically, not in passing." ;;
+      2) echo "EXECUTE PHASE 2 (Competing accounts) ONLY." ;;
+      3) echo "EXECUTE PHASE 3 (Discriminate) ONLY." ;;
+      4) echo "EXECUTE PHASE 4 ONLY." ;;
+    esac
+
+    if (( phase > 1 )); then
+      local prev=$((phase - 1))
+      local inherit="$CASE_DIR/packets/phase${prev}.md"
+      [[ "$phase" == "4" ]] && inherit="$CASE_DIR/packets/phase3.md"
+      [[ -s "$inherit" ]] || die "phase $phase needs $inherit and it is missing or empty."
+      echo
+      echo "You have NO prior context and you must not go looking for the original report — it was"
+      echo "sealed in Phase 0. This packet is your inheritance:"
+      echo
+      echo "<<<PACKET"
+      cat "$inherit"
+      echo "PACKET>>>"
+    fi
+
+    echo
+    echo "YOUR PREVIOUS ATTEMPT AT THIS PHASE WAS INTERRUPTED — it ran out of session, not out of"
+    echo "evidence."
+    echo
+    # DESCRIBE WHAT IS THERE; DO NOT NARRATE A DEATH SHAPE. An earlier version branched on
+    # "started the packet" vs "didn't" and asserted a story for each. There are more shapes than
+    # two — died mid-tool-call, died between messages, died with narration and no packet, thinking
+    # captured or blank — and asserting the wrong one sends the phase looking for something that
+    # was never written. Counting what the salvage actually contains covers every shape without
+    # anticipating any of them, and stays true when the shapes change.
+    if [[ -n "$salvage" ]]; then
+      local n_cmd n_res n_thought n_write
+      n_cmd=$(grep -c '· TOOL CALL ·'   "$salvage" || true)
+      n_res=$(grep -c '· TOOL RESULT ·' "$salvage" || true)
+      n_thought=$(grep -c '· THOUGHT'   "$salvage" || true)
+      n_write=$(grep -c 'TOOL CALL · Write' "$salvage" || true)
+      echo "The INTERRUPTED RUN below is that attempt, rebuilt from its own transcript in the order"
+      echo "it happened. It contains:"
+      echo "  · ${n_cmd} commands and ${n_res} results, in full"
+      if (( n_thought > 0 )); then
+        echo "  · ${n_thought} of your own recorded thoughts, at the points you had them"
+      else
+        echo "  · no recorded reasoning — that run was not capturing it. What you were thinking is"
+        echo "    gone; what you did and what it returned is not."
+      fi
+      if (( n_write > 0 )); then
+        echo "  · the packet as far as you had written it, cut off where the interruption landed"
+      else
+        echo "  · no packet text — the interruption landed before you began writing one"
+      fi
+      echo
+      echo "EVERYTHING IT SHOWS WAS ALREADY DONE. Do not repeat it. Carry on from the point it"
+      echo "stops. Those measurements, verdicts, boundary drops and orphan observations are the"
+      echo "expensive part, and not re-deriving them is what this resume exists for."
+      if (( phase > 1 )); then
+        echo
+        echo "The PACKET above is still your inheritance and still governs. The run below is your"
+        echo "own work in progress on top of it, not a substitute for it."
+      fi
+    else
+      echo "Below is what you had already written, captured as you were writing it, cut off"
+      echo "wherever the interruption landed."
+      echo
+      echo "THE INSTRUMENTS IT REPORTS WERE ALREADY RUN. Do not run them again. Continue from where"
+      echo "it stops, keeping everything already there verbatim."
+    fi
+    echo
+    echo "Run a command again ONLY if the text below is cut off mid-output and you cannot tell"
+    echo "what it said."
+    if [[ -n "$salvage" ]]; then
+      echo
+      echo "This is your interrupted attempt, rebuilt from its own transcript in the order it"
+      echo "happened — each thought, the command it led to, and what that command returned."
+      echo
+      echo "<<<INTERRUPTED RUN"
+      cat "$salvage"
+      echo "INTERRUPTED RUN>>>"
+    else
+      # Fallback: the live capture, which needs no parsing and so survives a corrupt transcript.
+      if [[ -s "$backup" ]]; then
+        echo
+        echo "<<<INTERRUPTED PACKET"
+        cat "$backup"
+        echo "INTERRUPTED PACKET>>>"
+      fi
+      if [[ -s "$narration" ]]; then
+        echo
+        echo "Your report to the human at the time it stopped:"
+        echo "<<<INTERRUPTED REPORT"
+        cat "$narration"
+        echo "INTERRUPTED REPORT>>>"
+      fi
+      if [[ -s "$thinking" ]]; then
+        echo
+        echo "<<<INTERRUPTED REASONING"
+        cat "$thinking"
+        echo "INTERRUPTED REASONING>>>"
+      fi
+    fi
+    packet_contract "$(packet_path_for "$phase")"
+  } > "$out"
+  printf '%s' "$out"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-phase system prompts. A system prompt outranks a user prompt, so the one rule each phase
 # most often breaks goes here rather than in the body.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -631,16 +1160,34 @@ say "  kind, even hedged — the protocol has collapsed. Bounce it [b] and it re
 
 phase="$START_PHASE"
 while (( phase <= STOP_AFTER )); do
+  # A resume replaces only the PROMPT — same model, same toolset, same system prompt, so the phase
+  # is still the phase. It applies to the resumed phase alone; everything after it runs normally.
+  # The normal builder is skipped entirely rather than built and discarded: build_phase1_prompt
+  # demands a report (sealed by now) and would overwrite prompts/phase1.txt, destroying the record
+  # of what the interrupted attempt was actually asked.
+  resuming=0
+  (( RESUME_PHASE == phase )) && resuming=1
+
   case "$phase" in
-    1) prompt="$(build_phase1_prompt)"; model="$MODEL"; tools="$TOOLS_MEASURE"; sys="$SYS_P1" ;;
-    2) prompt="$(build_carry_prompt 2 "EXECUTE PHASE 2 (Competing accounts) ONLY." "$CASE_DIR/packets/phase2.md")"
-       model="$MODEL"; tools="$TOOLS_MEASURE"; sys="$SYS_P2" ;;
-    3) prompt="$(build_carry_prompt 3 "EXECUTE PHASE 3 (Discriminate) ONLY." "$CASE_DIR/packets/phase3.md")"
-       model="$MODEL"; tools="$TOOLS_MEASURE"; sys="$SYS_P3" ;;
-    4) prompt="$(build_phase4_prompt)"; model="$FIX_MODEL"
+    1) model="$MODEL"; tools="$TOOLS_MEASURE"; sys="$SYS_P1"
+       (( resuming )) || prompt="$(build_phase1_prompt)" ;;
+    2) model="$MODEL"; tools="$TOOLS_MEASURE"; sys="$SYS_P2"
+       (( resuming )) || prompt="$(build_carry_prompt 2 "EXECUTE PHASE 2 (Competing accounts) ONLY." "$CASE_DIR/packets/phase2.md")" ;;
+    3) model="$MODEL"; tools="$TOOLS_MEASURE"; sys="$SYS_P3"
+       (( resuming )) || prompt="$(build_carry_prompt 3 "EXECUTE PHASE 3 (Discriminate) ONLY." "$CASE_DIR/packets/phase3.md")" ;;
+    4) model="$FIX_MODEL"
        if [[ "$MODE" == "fix" ]]; then tools="$TOOLS_FIX"; sys="$SYS_P4_FIX"
-       else                            tools="$TOOLS_MEASURE"; sys="$SYS_P4_PLAN"; fi ;;
+       else                            tools="$TOOLS_MEASURE"; sys="$SYS_P4_PLAN"; fi
+       (( resuming )) || prompt="$(build_phase4_prompt)" ;;
   esac
+
+  if (( resuming )); then
+    prompt="$(build_resume_prompt "$phase")"
+    say "${YEL}resuming phase $phase from its salvaged run — instruments are NOT re-run.${N}"
+    _sv="$CASE_DIR/packets/PHASE_BACKUP/phase${phase}_run.md"
+    [[ -s "$_sv" ]] && say "${DIM}  salvage: $(wc -c < "$_sv") chars · $(grep -c 'TOOL CALL' "$_sv" || true) tool calls recovered${N}"
+    RESUME_PHASE=0
+  fi
 
   run_phase "$phase" "$prompt" "$model" "$tools" "$sys"
 
