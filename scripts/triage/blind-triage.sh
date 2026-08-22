@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# blind-triage.sh — run the four-phase blind-triage protocol from the terminal.
+# blind-triage.sh — run the blind-triage protocol from the terminal: phase 0 (quarantine) then
+# the four work phases.
 #
 # WHAT THIS REPLACES
 # ------------------
@@ -13,6 +14,22 @@
 # context window, so a new process IS a cleared session — a stronger guarantee than /clear, because
 # nothing can leak even by accident. This script runs one process per phase and carries exactly one
 # artifact across each boundary: the handoff packet the previous phase wrote to disk.
+#
+# PHASE 0 IS ITS OWN PROCESS — the driver's second departure from SKILL.md
+# ------------------------------------------------------------------------
+# SKILL.md folds Phase 0 into Phase 1, which is right for the chat UI: a human is sitting there to
+# read the blinded symptom and object before evidence-gathering starts. Headless, nobody is, and
+# the cost was structural — the raw report was pasted into Phase 1's prompt and stayed in front of
+# the model for the whole evidence phase. Every OTHER boundary here is machinery (fresh process,
+# one packet, report.original.txt withheld by --add-dir); the boundary the skill is NAMED after was
+# the one enforced by asking the model not to look. SKILL.md concedes it: "Phase 0 blinding happens
+# after I've read the title, so I can under-blind."
+#
+# So phase 0 runs alone, sees the report, and writes packets/phase0.md. Phase 1 inherits that and
+# nothing else — identical to how 2, 3 and 4 already worked. Three things follow: the seal is
+# structural; the "object here, it's cheap" stop SKILL.md advertises finally exists (stop_line now
+# fires after phase 0, and never could while 0 and 1 shared a process); and a phase-1 death stops
+# costing you the blinding as well, so the retry re-runs instruments only.
 #
 # WHAT IT DELIBERATELY DOES NOT REPLACE
 # -------------------------------------
@@ -37,7 +54,7 @@
 # ------
 # * Git writes are denied to every phase (CLI deny-list + the repo's own git_write_guard hook).
 #   Even in --fix mode the change lands UNCOMMITTED in your working tree, per CLAUDE.md.
-# * In plan mode NO phase can edit source: Edit is absent from every toolset, phases 1-4.
+# * In plan mode NO phase can edit source: Edit is absent from every toolset, phases 0-4.
 # * The case dir lives OUTSIDE the repo (~/.claude-triage by default) so a later phase cannot read
 #   the sealed report, an earlier prompt, or an earlier transcript. Only packets/ is granted back.
 #   See the case-directory block below for the measurement that forced this.
@@ -50,12 +67,14 @@
 #
 # opens a menu: every case with its status (plan ready / awaiting phase N / phase N FAILED), then a
 # single action per case that works out what that status means and does it —
+#   not yet blinded    -> run phase 0, the only phase that sees the report (--phase 0)
 #   awaiting phase N   -> run phase N with the previous packet          (--phase N)
 #   phase N FAILED     -> resume phase N from its salvaged transcript   (--resume N)
 #   all four done      -> AUTHOR THE FIX from the approved plan         (--phase 4 --fix)
 # You never have to remember --phase versus --resume versus --fix, or which of a dozen directories
 # a case lives in. `v` pages the plan before you authorise it, `b` goes back anywhere, `q` quits,
-# `n` starts a new case in $EDITOR. Every flag below still works exactly as before.
+# `n` starts a new case in whatever editor is installed, or a paste box if none is. Every flag
+# below still works exactly as before.
 #
 # IF A PHASE DIES — packets/PHASE_BACKUP/
 # ---------------------------------------
@@ -109,8 +128,10 @@ FIX_MODEL="${TRIAGE_FIX_MODEL:-}"      # phase 4: authoring. Empty => same as MO
                                        #   Set TRIAGE_FIX_MODEL=fable to follow it literally.
 PERM_MODE="${TRIAGE_PERMISSION_MODE:-acceptEdits}"
 CASE_DIR=""
-START_PHASE=1
-RESUME_PHASE=0                         # --resume N: finish phase N from its live backup
+START_PHASE=0                          # 0 = quarantine. A new case always starts there; it is the
+                                       #   only phase that sees the raw report.
+RESUME_PHASE=-1                        # --resume N: finish phase N from its live backup.
+                                       #   -1, not 0, because 0 is now a real phase number.
 STOP_AFTER=4
 AUTO=0
 DRY_RUN=0
@@ -204,9 +225,9 @@ while [[ $# -gt 0 ]]; do
     -m|--model)       MODEL="${2:?--model needs an alias}"; shift 2 ;;
     --fix-model)      FIX_MODEL="${2:?--fix-model needs an alias}"; shift 2 ;;
     --case)           CASE_DIR="${2:?--case needs a directory}"; shift 2 ;;
-    --phase)          START_PHASE="${2:?--phase needs 1-4}"; shift 2 ;;
-    --resume)         RESUME_PHASE="${2:?--resume needs 1-4}"; START_PHASE="$RESUME_PHASE"; shift 2 ;;
-    --stop-after)     STOP_AFTER="${2:?--stop-after needs 1-4}"; shift 2 ;;
+    --phase)          START_PHASE="${2:?--phase needs 0-4}"; shift 2 ;;
+    --resume)         RESUME_PHASE="${2:?--resume needs 0-4}"; START_PHASE="$RESUME_PHASE"; shift 2 ;;
+    --stop-after)     STOP_AFTER="${2:?--stop-after needs 0-4}"; shift 2 ;;
     --salvage-chars)  SALVAGE_CHARS="${2:?--salvage-chars needs a number (0 = uncapped)}"; shift 2 ;;
     --permission-mode) PERM_MODE="${2:?}"; shift 2 ;;
     --fix)            MODE="fix"; shift ;;
@@ -248,10 +269,32 @@ case_status() {
   # distinguish "plan written" from "plan written and authored". Without this the completed
   # screen reads identically before and after the expensive run.
   [[ -s "$dir/packets/FIX_AUTHORED" ]] && ST_FIXED="$(cat "$dir/packets/FIX_AUTHORED")"
+  # ST_DONE stays "highest of the WORK phases 1-4 that finished", so every count, banner and
+  # ST_DONE+1 below keeps its old meaning. Phase 0 is tracked separately because it is a
+  # quarantine step, not a quarter of the work — and because ST_DONE==0 already means "nothing
+  # done" and cannot also mean "phase 0 done".
+  ST_BLINDED=0
+  [[ -s "$(_packet_of "$dir" 0)" ]] && ST_BLINDED=1
   for p in 1 2 3 4; do
     [[ -s "$(_packet_of "$dir" "$p")" ]] && ST_DONE=$p
   done
-  local next=$((ST_DONE + 1))
+  # The next phase to RUN.
+  #
+  # "No phase0.md" does NOT mean "not blinded" — it means "no phase0.md". Every case created
+  # before the phase-0 split was blinded INSIDE phase 1 and never had that file, so
+  # keying the next phase on ST_BLINDED alone sent a case with phase1.md and phase2.md on disk
+  # back to phase 0, described it as "not started", and offered to re-blind it — which would have
+  # overwritten two finished phases. Work already done is the stronger signal, so it wins: a case
+  # with ANY work packet is mid-flight and resumes after its highest one, blinded or not.
+  if   (( ST_DONE > 0 ));    then ST_NEXT=$((ST_DONE + 1))   # underway (pre- or post-split)
+  elif (( ST_BLINDED == 1 )); then ST_NEXT=1                 # blinded, no work yet
+  else                             ST_NEXT=0                 # genuinely nothing done
+  fi
+  # A case that has work but no phase0.md predates the split. Phase 0 is not owed — it already
+  # happened, inside phase 1 — and the flag exists so the menu never offers to redo it.
+  ST_PRESPLIT=0
+  (( ST_DONE > 0 && ST_BLINDED == 0 )) && ST_PRESPLIT=1
+  local next=$ST_NEXT
   if (( next <= 4 )) && compgen -G "$dir/logs/phase${next}*.jsonl" >/dev/null; then
     ST_FAILED=$next
     # One cheap grep for the two endings worth naming in a list.
@@ -268,24 +311,80 @@ case_status() {
   # because the second case had ST_DONE=0 and took that branch.
   local prefix=""
   (( ST_DONE > 0 )) && prefix="phases 1-${ST_DONE} done · "
+  (( ST_PRESPLIT )) && prefix="phases 1-${ST_DONE} done (pre-split) · "
   if   (( ST_DONE == 4 )); then
     if [[ -n "$ST_FIXED" ]]; then ST_TEXT="4 of 4 · fix authored"
     else                          ST_TEXT="4 of 4 · plan ready to author"; fi
   elif (( ST_FAILED ));    then ST_TEXT="${prefix}phase ${ST_FAILED} FAILED${ST_WHY:+ ($ST_WHY)} · salvageable"
-  elif (( ST_DONE == 0 )); then ST_TEXT="not started"
-  else                          ST_TEXT="${prefix}awaiting phase ${next}"
+  elif (( ST_DONE > 0 )); then  ST_TEXT="${prefix}awaiting phase ${next}"
+  elif (( ST_BLINDED == 0 )); then ST_TEXT="not started · report not yet blinded"
+  else                          ST_TEXT="blinded · awaiting phase 1"
   fi
   return 0
 }
 
-# A new case needs a multi-line report, which `read -r` mangles. An editor handles paste properly.
+# ─────────────────────────────────────────────────────────────────────────────
+# Editing without an editor
+#
+# `${EDITOR:-nano}` assumed nano. This image has NO editor at all — not nano, not vim, not vi,
+# not ed — and `$EDITOR` is unset, so `n` died with "nano: command not found" and swallowed the
+# report. Hence two layers: resolve whatever IS installed, and if the answer is nothing, read the
+# text straight off /dev/tty instead of demanding a program that isn't there.
+# ─────────────────────────────────────────────────────────────────────────────
+# First editor that actually exists. $VISUAL/$EDITOR win when set; `${e%% *}` so EDITOR="code -w"
+# is probed as `code`.
+_pick_editor() {
+  local e
+  for e in "${VISUAL:-}" "${EDITOR:-}" nano vim vi nvim micro emacs ed; do
+    [[ -n "$e" ]] || continue
+    command -v "${e%% *}" >/dev/null 2>&1 && { printf '%s' "$e"; return 0; }
+  done
+  return 1
+}
+
+# Short label for the menu, so it never again advertises a program that is not installed.
+_editor_label() {
+  local ed
+  if ed="$(_pick_editor)"; then printf 'opens %s' "${ed%% *}"
+  else                          printf 'paste inline'; fi
+}
+
+# Read from the terminal until EOF (Ctrl-D) or a lone "." — the escape hatch for anyone who does
+# not know Ctrl-D. Writes to $1. Returns 1 when nothing but whitespace was entered.
+_read_multiline_tty() {
+  local dest="$1" line buf=""
+  while IFS= read -r line < /dev/tty; do
+    [[ "$line" == "." ]] && break
+    buf+="$line"$'\n'
+  done
+  printf '%s' "$buf" > "$dest"
+  [[ -n "${buf//[[:space:]]/}" ]]
+}
+
+# Open $1 for editing, or fall back to a paste box that REPLACES it. Empty paste leaves the file
+# untouched, which is what makes the fallback safe on an existing packet.
+edit_or_paste() {
+  local file="$1" ed tmp
+  if ed="$(_pick_editor)"; then
+    $ed "$file" < /dev/tty > /dev/tty 2>&1 || true
+    return 0
+  fi
+  say "${DIM}no editor installed — paste the text, then Ctrl-D (or a lone '.') to finish.${N}"
+  say "${DIM}Empty input leaves the file unchanged.${N}"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/blind-triage-paste.XXXXXX")"
+  _read_multiline_tty "$tmp" && cp "$tmp" "$file"
+  rm -f "$tmp"
+}
+
+# A new case needs a multi-line report, which `read -r` mangles. An editor handles paste properly;
+# so does the /dev/tty fallback above.
 menu_new_case() {
   local tmp; tmp="$(mktemp "${TMPDIR:-/tmp}/blind-triage-report.XXXXXX")"
   {
     echo "# Paste the bug report below, save, and quit."
     echo "# Lines starting with # are ignored. An empty file cancels."
   } > "$tmp"
-  "${EDITOR:-nano}" "$tmp" < /dev/tty > /dev/tty 2>&1 || true
+  edit_or_paste "$tmp"
   local text; text="$(grep -v '^#' "$tmp" | sed '/./,$!d')"
   rm -f "$tmp"
   if [[ -z "${text//[[:space:]]/}" ]]; then
@@ -293,7 +392,7 @@ menu_new_case() {
     return 1
   fi
   REPORT_TEXT="$text"
-  CASE_DIR=""; START_PHASE=1; RESUME_PHASE=0
+  CASE_DIR=""; START_PHASE=0; RESUME_PHASE=-1
   return 0
 }
 
@@ -325,10 +424,14 @@ menu_case() {
       say "  ${B}1${N}  ${CYA}CONTINUE${N} → resume phase ${ST_FAILED} from its salvaged run"
       say "     ${DIM}Rebuilds the lost phase from its own transcript — every thought, command${N}"
       say "     ${DIM}and result, in order — and retries it. The instruments are NOT re-run.${N}"
+    elif (( ST_NEXT == 0 )); then
+      say "  ${B}1${N}  ${CYA}CONTINUE${N} → run phase 0 (quarantine)"
+      say "     ${DIM}The only phase that ever sees the raw report. It writes the blinded symptom;${N}"
+      say "     ${DIM}every later phase inherits that packet and nothing else.${N}"
     else
-      say "  ${B}1${N}  ${CYA}CONTINUE${N} → run phase $((ST_DONE + 1))"
-      say "     ${DIM}Phase ${ST_DONE} finished and its packet is on disk. This hands that packet${N}"
-      say "     ${DIM}to a fresh, context-cleared phase $((ST_DONE + 1)), exactly as the protocol wants.${N}"
+      say "  ${B}1${N}  ${CYA}CONTINUE${N} → run phase ${ST_NEXT}"
+      say "     ${DIM}Phase $((ST_NEXT - 1)) finished and its packet is on disk. This hands that packet${N}"
+      say "     ${DIM}to a fresh, context-cleared phase ${ST_NEXT}, exactly as the protocol wants.${N}"
     fi
     say ""
     say "  ${B}b${N}  back to the case list      ${B}q${N}  quit"
@@ -337,9 +440,9 @@ menu_case() {
     read -r key < /dev/tty || key="q"
     case "${key,,}" in
       1) CASE_DIR="$dir"
-         if   (( ST_DONE == 4 )); then MODE="fix"; RESUME_PHASE=0; START_PHASE=4
+         if   (( ST_DONE == 4 )); then MODE="fix"; RESUME_PHASE=-1; START_PHASE=4
          elif (( ST_FAILED ));    then RESUME_PHASE=$ST_FAILED; START_PHASE=$ST_FAILED
-         else                          RESUME_PHASE=0;          START_PHASE=$((ST_DONE + 1)); fi
+         else                          RESUME_PHASE=-1;         START_PHASE=$ST_NEXT; fi
          return 0 ;;
       v) if (( ST_DONE == 4 )); then
            "${PAGER:-less}" "$(_packet_of "$dir" 4)" < /dev/tty > /dev/tty 2>&1 || true
@@ -381,7 +484,7 @@ menu_main() {
       done
     fi
     say ""
-    say "  ${B}n${N}  new case (opens ${EDITOR:-nano} for the report)      ${B}q${N}  quit"
+    say "  ${B}n${N}  new case ($(_editor_label) for the report)      ${B}q${N}  quit"
     say ""
     printf '%s' "> "
     read -r key < /dev/tty || key="q"
@@ -405,26 +508,37 @@ fi
 [[ -x "$(command -v claude)" ]] || die "the 'claude' CLI is not on PATH."
 [[ -f "$SKILL_FILE" ]] || die "blind-triage skill not found at $SKILL_FILE"
 [[ -f "$RUN_EXTRACTOR" ]] || die "salvage tool not found at $RUN_EXTRACTOR (needed by --resume)"
-(( START_PHASE >= 1 && START_PHASE <= 4 )) || die "--phase must be 1-4"
+(( START_PHASE >= 0 && START_PHASE <= 4 )) || die "--phase must be 0-4"
 (( STOP_AFTER >= START_PHASE && STOP_AFTER <= 4 )) || die "--stop-after must be >= --phase and <= 4"
 [[ "$MODE" == "plan" || "$MODE" == "fix" ]] || die "mode must be plan or fix (--plan / --fix)"
 [[ -n "$FIX_MODEL" ]] || FIX_MODEL="$MODEL"
 
-(( RESUME_PHASE >= 0 && RESUME_PHASE <= 4 )) || die "--resume must be 1-4"
-if (( RESUME_PHASE > 0 )); then
+(( RESUME_PHASE == -1 || ( RESUME_PHASE >= 0 && RESUME_PHASE <= 4 ) )) || die "--resume must be 0-4"
+if (( RESUME_PHASE >= 0 )); then
   [[ -n "$CASE_DIR" ]] || die "--resume needs --case <dir> — the backup it continues lives there."
 fi
 
-# A report is required to START at phase 1; resuming later needs a case dir with packets in it.
-# --resume 1 is the exception: Phase 0 already ran, so the blinded symptom comes from the backup
-# and re-feeding the original report would un-blind the phase it is resuming.
-if (( START_PHASE == 1 && RESUME_PHASE == 0 )); then
+# Re-entering phase 0 on an EXISTING case: take the report off disk. Every case dir already stores
+# report.original.txt (written once, below), so a case that predates the phase-0 split — all of
+# them, at the time of the split — reads as "not yet blinded" and the menu sends it to phase 0 with no report
+# in hand. Without this it dies "no report given" on a case whose report is sitting right there.
+# This is the ONE sanctioned read of that file, and it feeds the only phase allowed to see it.
+if (( START_PHASE == 0 && RESUME_PHASE < 0 )) \
+   && [[ -z "$REPORT_TEXT" && -z "$REPORT_FILE" && -n "$CASE_DIR" && -s "$CASE_DIR/report.original.txt" ]]; then
+  REPORT_TEXT="$(cat "$CASE_DIR/report.original.txt")"
+  say "${DIM}re-blinding from the case's stored report.original.txt${N}"
+fi
+
+# A report is required to START at phase 0; every later phase needs a case dir with packets in it.
+# Phase 0 is the ONLY consumer of the raw report — a --phase 1 or a --resume reads the blinded
+# packet (or the backup) instead, and re-feeding the original there would un-blind it.
+if (( START_PHASE == 0 && RESUME_PHASE < 0 )); then
   if [[ -z "$REPORT_TEXT" && -z "$REPORT_FILE" && ! -t 0 ]]; then
     REPORT_TEXT="$(cat)"            # allows:  cat finding.txt | blind-triage.sh
   fi
   [[ -n "$REPORT_TEXT" || -n "$REPORT_FILE" ]] || die "no report given. Pass text, -f <file>, or pipe it in."
 else
-  [[ -n "$CASE_DIR" ]] || die "--phase >1 needs --case <dir> so it can read the previous packet."
+  [[ -n "$CASE_DIR" ]] || die "--phase >0 needs --case <dir> so it can read the previous packet."
 fi
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -492,7 +606,7 @@ unset _td_probe
 
 # The original report is stored ONCE, here, and never re-fed to a later phase. Phase 0 blinds it;
 # re-pasting it downstream is the documented way to re-poison the protocol.
-if (( START_PHASE == 1 && RESUME_PHASE == 0 )); then
+if (( START_PHASE == 0 && RESUME_PHASE < 0 )); then
   if [[ -n "$REPORT_FILE" ]]; then
     [[ -f "$REPORT_FILE" ]] || die "no such file: $REPORT_FILE"
     REPORT_FILE="$(cd "$(dirname "$REPORT_FILE")" && pwd)/$(basename "$REPORT_FILE")"
@@ -701,11 +815,28 @@ stop_line() {
 
   say ""
   rule
-  say "${B}═══ PHASE $phase COMPLETE ($phase of 4 done) ═══${N}"
+  if (( phase == 0 )); then
+    say "${B}═══ PHASE 0 COMPLETE — REPORT BLINDED AND SEALED ═══${N}"
+  else
+    say "${B}═══ PHASE $phase COMPLETE ($phase of 4 done) ═══${N}"
+  fi
   say "packet: ${CYA}${packet}${N}"
   say ""
   say "${YEL}${watch}${N}"
   rule
+
+  # Phase 0's own glance check. Its packet is the entire inheritance of every later phase, so the
+  # two fields that carry the seal are worth a string test: a missing `observed:` means nothing
+  # downstream has a symptom, and a missing `NOT carried forward` means the human cannot see what
+  # was deleted — which is the one thing SKILL.md says they must be able to object to.
+  if (( phase == 0 )) && [[ -f "$packet" ]]; then
+    grep -qi '^[[:space:]]*observed[[:space:]]*:' "$packet" \
+      || say "${RED}glance check:${N} no 'observed :' line. Every later phase inherits this packet and would start with no symptom."
+    grep -qi 'NOT carried forward' "$packet" \
+      || say "${RED}glance check:${N} no 'NOT carried forward' field — you cannot see what it deleted, which is the whole point of the stop."
+    grep -qi 'ALSO OBSERVED' "$packet" \
+      || say "${RED}glance check:${N} no 'ALSO OBSERVED' field. If the report stated more than one observable, it has been dropped rather than set aside."
+  fi
 
   # THE GLANCE CHECK, mechanised where it can be. These are cheap string tests, not judgement —
   # they catch the two failure shapes the skill says have actually cost runs.
@@ -735,7 +866,7 @@ stop_line() {
     case "${key,,}" in
       "")  return 0 ;;
       p)   rule; cat "$packet"; rule ;;
-      e)   "${EDITOR:-nano}" "$packet" < /dev/tty > /dev/tty 2>&1 || true ;;
+      e)   edit_or_paste "$packet" ;;
       b)   return 2 ;;
       s)   say "stopped. Resume with:  $0 --case '$CASE_DIR' --phase $((phase + 1))"; exit 0 ;;
       *)   say "${DIM}(unrecognised — Enter, p, e, b or s)${N}" ;;
@@ -781,6 +912,11 @@ You are running HEADLESS, driven by scripts/triage/blind-triage.sh. Facts about 
     $CASE_DIR/scratch
   Many of this repo's tools also take an --out flag, which is cheaper than redirecting.
 - Execute ONLY the phase named below. Do not continue into the next one.
+- DO NOT END YOUR TURN until the deliverable file named below exists on disk. In this headless
+  driver a turn that ends having called no tool ENDS THE PROCESS, and the phase is lost with it —
+  the CLI reports success, because mechanically it was one. Measured: a phase emitted
+  "I'll start with Phase 0 — quarantine — before any tool call", ended its turn, and the driver
+  got 1 turn and no packet. Announcing what you are about to do is not doing it. Write the file.
 EOF
 }
 
@@ -809,18 +945,36 @@ DELIVERABLE — BOTH of these, or the driver cannot carry your work forward:
 EOF
 }
 
-build_phase1_prompt() {
-  local out="$CASE_DIR/prompts/phase1.txt"
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 0 is its OWN process, and that is the whole point of the skill.
+#
+# It used to share Phase 1's context: the raw report was pasted into prompts/phase1.txt and stayed
+# in front of the model for the entire evidence phase, which was asked to blind itself and then
+# not look. Every OTHER boundary here is enforced by machinery — a fresh process plus one packet,
+# with --add-dir withholding report.original.txt from phases 2-4 (see the note above BACKUP_DENY).
+# The one boundary the skill exists to create was enforced by willpower, and SKILL.md's own HONEST
+# LIMITS says so: "Phase 0 blinding happens after I've read the title, so I can under-blind."
+#
+# Splitting it buys three things beyond the seal:
+#   * the correction point SKILL.md advertises ("object here, it's cheap") becomes REAL — stop_line
+#     now fires after phase 0, and it never could when 0 and 1 shared a process;
+#   * a phase-1 death stops costing the blinding too, so a retry re-runs instruments only;
+#   * the tool-free window closes by construction — phase 0 has a packet it MUST write, so it
+#     cannot end its turn having called nothing (observed; see headless_preamble).
+# ─────────────────────────────────────────────────────────────────────────────
+build_phase0_prompt() {
+  local out="$CASE_DIR/prompts/phase0.txt"
   {
     echo "/blind-triage"
     echo
     headless_preamble
     echo
-    echo "EXECUTE PHASE 0 (Quarantine) AND PHASE 1 (Evidence). Stop at the Phase 1 stop line."
-    echo "Phase 1's hard ban is the whole point: no cause, no suspect module, no 'intersection',"
-    echo "no fix kind — not hedged, not parenthetically, not in passing."
+    echo "EXECUTE PHASE 0 (Quarantine) ONLY. Do not run an instrument, do not open a file named"
+    echo "below, do not begin Phase 1 — a later, separate process does that and it will never see"
+    echo "this report. What you write in the packet is ALL it gets, so a mechanism word you leave"
+    echo "in is one you have handed forward, and an observation you drop is one nobody recovers."
     echo
-    echo "THE REPORT (unblinded — quarantine it in Phase 0, then treat it as SEALED):"
+    echo "THE REPORT (you are the ONLY phase that ever sees this; it is SEALED after you):"
     echo "<<<REPORT"
     if [[ -n "$REPORT_FILE" ]]; then
       # Small files are inlined so the blinding happens on the real words. Big ones are handed over
@@ -836,13 +990,41 @@ build_phase1_prompt() {
       printf '%s\n' "$REPORT_TEXT"
     fi
     echo "REPORT>>>"
-    packet_contract "$CASE_DIR/packets/phase1.md"
+    packet_contract "$CASE_DIR/packets/phase0.md" \
+      "BLINDED SYMPTOM block — the whole block from SKILL.md Phase 0, starting at the
+     'BLINDED SYMPTOM' line and carrying observed / chosen because / runs / ALSO OBSERVED /
+     NOT carried forward. It is the ENTIRE inheritance of every later phase"
   } > "$out"
   printf '%s' "$out"
 }
 
+# `NOT carried forward` is written FOR THE HUMAN, at the phase-0 stop, so they can object to what
+# was deleted. Its content is the mechanism words themselves — "the worst offenders", per SKILL.md.
+# So it must reach the terminal and must NOT reach phase 1: carrying it forward hands the next
+# phase the exact nouns the blinding removed, and re-poisons the protocol through the field that
+# exists to prove the blinding happened. Caught by the seal test on the split itself:
+# phase1.txt contained "widget loader" and "frobnicator" on the NOT-carried-forward line.
+#
+# The packet on disk keeps the field (that is what stop_line shows you). Only the CARRIED copy is
+# filtered. Drops the field's own line plus any continuation lines indented under it.
+_seal_packet() {
+  awk '
+    /^[[:space:]]*NOT carried forward[[:space:]]*:/ {
+      match($0, /^[[:space:]]*/); skip_indent = RLENGTH; skipping = 1
+      print substr($0, 1, skip_indent) "NOT carried forward: [withheld from this phase by the driver]"
+      next
+    }
+    skipping {
+      match($0, /^[[:space:]]*/)
+      if ($0 ~ /^[[:space:]]*$/ || RLENGTH > skip_indent) next
+      skipping = 0
+    }
+    { print }
+  ' "$1"
+}
+
 build_carry_prompt() {
-  # Phases 2-4 receive ONE artifact: the previous phase's packet. Nothing else crosses.
+  # Phases 1-4 receive ONE artifact: the previous phase's packet. Nothing else crosses.
   local phase="$1" instruction="$2" packet_path="$3"
   local prev=$((phase - 1))
   local out="$CASE_DIR/prompts/phase${phase}.txt"
@@ -859,7 +1041,7 @@ build_carry_prompt() {
     echo "sealed in Phase 0. This packet is your entire inheritance:"
     echo
     echo "<<<PACKET"
-    cat "$CASE_DIR/packets/phase${prev}.md"
+    _seal_packet "$CASE_DIR/packets/phase${prev}.md"
     echo "PACKET>>>"
     if [[ -n "$packet_path" ]]; then
       packet_contract "$packet_path"
@@ -1149,6 +1331,7 @@ build_resume_prompt() {
 # Per-phase system prompts. A system prompt outranks a user prompt, so the one rule each phase
 # most often breaks goes here rather than in the body.
 # ─────────────────────────────────────────────────────────────────────────────
+SYS_P0="You are Phase 0 of blind-triage, and you are the ONLY phase that will ever see the raw report — it is sealed after you, by file permission, not by good intentions. Restate it as what was OBSERVED: keep values, identifiers, run names and counts; delete every noun phrase naming a mechanism, cause, code site or fix, and delete the report's site list outright. 'observed:' carries exactly ONE symptom and you say in one line why that one; everything else observable goes to ALSO OBSERVED verbatim, and every mechanism word you removed goes to NOT carried forward so the human can object. Do not run an instrument, do not open a file the report names, do not begin Phase 1. Write the packet — announcing the blinding is not doing it."
 SYS_P1="You are Phase 1 of blind-triage. HARD BAN: you may not name a cause, a suspect module, an intersection, or a fix kind — hedged or otherwise. Evidence only. Every list a tool returns gets a per-row verdict in writing. Every escalation a tool names gets RUN in this phase. Anything you set aside goes in ORPHAN OBSERVATIONS verbatim; NONE is a claim, not a default."
 SYS_P2="You are Phase 2 of blind-triage. Produce 2-3 RIVAL accounts and refuse to rank them. At least one must be 'a consumer is being starved of a field that exists upstream'. A confirming test does not count — only the single test that would KILL each account. Carry every orphan observation and boundary drop forward verbatim."
 SYS_P3="You are Phase 3 of blind-triage. Build every fixture by CALLING THE PRODUCTION CODE — no SQL, no vault dump, no hand-written dict standing in for real data. Report survivors and corpses, nothing else. If ZERO accounts survive the phase is NOT over: close the holes the packet names and re-read the boundaries no account sent you to."
@@ -1158,6 +1341,12 @@ SYS_P4_PLAN="You are Phase 4 of blind-triage, running in PLAN mode. You produce 
 # ─────────────────────────────────────────────────────────────────────────────
 # Watch-for banners, lifted from the skill so the human gets them without opening SKILL.md
 # ─────────────────────────────────────────────────────────────────────────────
+WATCH_0="★ READ THE observed: LINE NOW — this is the cheapest correction point in the protocol.
+  It must name ONE symptom. If it picked the wrong one, welded two together, or left a
+  mechanism word in, bounce it [b] and say which — five seconds here, four phases later.
+  Everything downstream inherits THIS packet and never sees your report again.
+  Also check NOT carried forward: that list is what it deleted. If the answer is in it,
+  bounce it now."
 WATCH_1="★ WATCH FOR IN PHASE 2: it must give you 2-3 RIVAL accounts and refuse to rank them.
   If it recommends one, or one arrives sounding obviously right — bounce it [b] and say
   \"give me the second account\". A favourite in Phase 2 is the old failure returning.
@@ -1196,8 +1385,12 @@ while (( phase <= STOP_AFTER )); do
   (( RESUME_PHASE == phase )) && resuming=1
 
   case "$phase" in
+    0) model="$MODEL"; tools="$TOOLS_MEASURE"; sys="$SYS_P0"
+       (( resuming )) || prompt="$(build_phase0_prompt)" ;;
     1) model="$MODEL"; tools="$TOOLS_MEASURE"; sys="$SYS_P1"
-       (( resuming )) || prompt="$(build_phase1_prompt)" ;;
+       # Phase 1 now inherits ONE artifact, exactly like 2-4: the blinded symptom. The raw report
+       # never enters its context, so the seal is structural rather than self-imposed.
+       (( resuming )) || prompt="$(build_carry_prompt 1 "EXECUTE PHASE 1 (Evidence) ONLY. Phase 1's hard ban is the whole point: no cause, no suspect module, no 'intersection', no fix kind — not hedged, not parenthetically, not in passing." "$CASE_DIR/packets/phase1.md")" ;;
     2) model="$MODEL"; tools="$TOOLS_MEASURE"; sys="$SYS_P2"
        (( resuming )) || prompt="$(build_carry_prompt 2 "EXECUTE PHASE 2 (Competing accounts) ONLY." "$CASE_DIR/packets/phase2.md")" ;;
     3) model="$MODEL"; tools="$TOOLS_MEASURE"; sys="$SYS_P3"
@@ -1213,7 +1406,7 @@ while (( phase <= STOP_AFTER )); do
     say "${YEL}resuming phase $phase from its salvaged run — instruments are NOT re-run.${N}"
     _sv="$CASE_DIR/packets/PHASE_BACKUP/phase${phase}_run.md"
     [[ -s "$_sv" ]] && say "${DIM}  salvage: $(wc -c < "$_sv") chars · $(grep -c 'TOOL CALL' "$_sv" || true) tool calls recovered${N}"
-    RESUME_PHASE=0
+    RESUME_PHASE=-1
   fi
 
   run_phase "$phase" "$prompt" "$model" "$tools" "$sys"
