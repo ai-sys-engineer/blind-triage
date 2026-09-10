@@ -876,6 +876,9 @@ stop_line() {
 
 # A bounce is the skill's own instruction ("bounce it and say ...") made executable: same phase,
 # same input, plus your objection.
+# KNOWN BUG (#1): this function is called via command substitution, so the prompt
+# lines printed below are captured instead of shown. The read still waits on
+# /dev/tty, but the user sees no prompt.
 bounce_note() {
   say ""
   say "${B}Your objection${N} — one line, handed to the phase verbatim (it re-runs from scratch):"
@@ -1419,6 +1422,9 @@ while (( phase <= STOP_AFTER )); do
   decision=$?
   set -e
 
+  # KNOWN BUG (#1): the objection appended below is lost. `continue` returns to the
+  # top of the loop, where build_carry_prompt rewrites the prompt file before
+  # run_phase runs, so the re-run never sees the note.
   if (( decision == 2 )); then
     note="$(bounce_note)"
     if [[ -n "$note" ]]; then
