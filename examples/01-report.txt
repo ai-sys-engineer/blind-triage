@@ -1,0 +1,9 @@
+Please note, we have already made fixes to the code base recently so this bug may very well have been impacted by the fixes post ledger of the bug. It may not even be relevant anymore, or it may still exist.
+ID: F8
+Title: max_ecr_loops raised 3 -> 9 in the working tree, uncommitted
+Status: Decision needed
+Class: Housekeeping
+Chronic?: n/a
+Run / ECR: src/flow_design.py:1660 + docs/CONFIGURATION.md
+Evidence: 055902 deadlocked at 3; 065833 used the raised budget and was killed at 4.
+Offline testable?: n/a

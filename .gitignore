@@ -1,0 +1,7 @@
+# The four audits in examples/instruments/ are Python; running one leaves bytecode behind.
+__pycache__/
+*.py[cod]
+
+# Editor / OS noise
+.DS_Store
+*.swp
