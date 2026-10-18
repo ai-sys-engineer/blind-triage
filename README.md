@@ -2,9 +2,9 @@
 
 **A phased, context-cleared protocol that re-diagnoses and fixes bugs that already come with an answer attached.**
 
-Not designed. Ground out. Against one bug whose answer was already known, **repeated trials failed
-until reaching a passing trial**, and it kept changing shape for a good while after that. What follows
-came out of that trial and error.
+Developed against a known-answer case: a bug whose cause was already established, and which
+single-session attempts kept getting wrong. The protocol was iterated until a trial reached that
+answer, and it kept changing shape for a good while after that.
 
 ## How it works
 
@@ -30,6 +30,34 @@ Two things carry the weight:
   packet carries an `ORPHAN OBSERVATIONS` field that must read `NONE` explicitly — a blank is
   visible, a silent omission isn't. No fix is accepted until the killing question is answered:
   *what single result would have proved this wrong, and did you run it?*
+
+## What's built
+
+The driver, [`scripts/triage/blind-triage.sh`](scripts/triage/blind-triage.sh), runs each phase as a
+separate headless `claude -p` process, with two Python helpers for live output and recovery. Some
+rules are enforced by that machinery. The rest are instructions in the prompt, and the stop line
+after each phase is where a human checks them.
+
+**Enforced by the driver**
+
+- **One process per phase.** Each phase starts with no memory of the last and receives one file: the
+  previous phase's packet.
+- **Phase 0 runs alone.** It is the only phase that sees the original report.
+- **The report is sealed by the filesystem.** The case directory lives outside the repo
+  (`~/.claude-triage` by default), and permission rules stop later phases from reading the original
+  report, the logs and the prompts.
+- **Git stays yours.** The common git write commands (`commit`, `push`, `reset`, …) are on every
+  phase's deny list; committing is left to you.
+- **Plan first.** Phase 4 writes a plan by default, with the Edit tool removed. `--fix` authors an
+  approved plan as a separate run.
+- **Recoverable phases.** Each packet is streamed to disk as it is written, so a phase that dies
+  mid-run can be resumed (`--resume N`) rather than rerun from scratch.
+
+**Asked for in the prompt, checked by you at each stop line**
+
+- no cause named in Phase 1, and no ranking of the rival accounts in Phase 2;
+- the `ORPHAN OBSERVATIONS` field, filled in explicitly;
+- the killing question, answered before a fix.
 
 ## What it looks like
 
@@ -72,7 +100,7 @@ The protocol itself is [`.claude/skills/blind-triage/SKILL.md`](.claude/skills/b
 
 ## Edge cases & observations
 
-- **It was tuned until it passed a known-answer case.**
+- **It has been tested against one known-answer case** — the one it was tuned on.
 - **It buys sequencing, not insight.** It stops evidence and hypothesis from collapsing into one
   breath. It does not make anyone smarter about your system.
 - **Phase 0 blinding happens after the title has been read**, so it can under-blind. That's why the
@@ -81,8 +109,6 @@ The protocol itself is [`.claude/skills/blind-triage/SKILL.md`](.claude/skills/b
   a later phase re-poisons it — once blinded, sealed.
 - **It costs real money, per phase** — each phase is its own model session, which is the price of the
   isolation. Details: [`docs/USAGE.md`](docs/USAGE.md).
-- **Bounce objections are silently dropped** — pressing `[b]` at a phase stop line re-runs it without
-  your objection, and the prompt doesn't reappear. Use `[e]` to edit the packet directly instead.
 
 ## What's in here
 
@@ -110,3 +136,8 @@ The skill is the interesting file and GitHub hides dotted directories, so here i
 **Effort was made to keep almost everything here as was in the run:** shell drivers, all three Python
 helpers, all four audits, and both example artifacts. **Two files are excerpts** — `blind-triage/SKILL.md`
 and `fix-run/SKILL.md` — and each marks its own cuts in place, stating what was removed and why.
+
+## Known limitations
+
+- Pressing `[b]` (bounce) at a phase stop line re-runs the phase without your objection. Use `[e]` to
+  edit the packet directly instead.
